@@ -3,15 +3,88 @@
 $script:LazyModules = @{}
 $script:LoadedModules = @{}
 
+#region Private
+
+function Get-LazyModuleCommands {
+    param([string]$ModulePath)
+
+    $commands = [System.Collections.Generic.List[string]]::new()
+    $resolvedPsd1 = $null
+
+    if ($ModulePath -match '\.psd1$' -and (Test-Path $ModulePath)) {
+        $resolvedPsd1 = $ModulePath
+    } else {
+        $resolvedPsd1 = (
+            Get-Module -Name $ModulePath -ListAvailable -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        )?.Path
+    }
+
+    if (-not $resolvedPsd1) {
+        Write-Warning "PSLazy: Could not locate module '$ModulePath'."
+        return $commands
+    }
+
+    try {
+        $manifest = Import-PowerShellDataFile -Path $resolvedPsd1 -ErrorAction Stop
+
+        foreach ($key in @('FunctionsToExport', 'CmdletsToExport', 'AliasesToExport')) {
+            $exports = $manifest[$key] | Where-Object { $_ -and $_ -ne '*' }
+            if ($exports) { $commands.AddRange([string[]]$exports) }
+        }
+
+        if ($commands.Count -eq 0) {
+            Write-Warning "PSLazy: '$ModulePath' exports wildcards or nothing — cannot lazy-register. Load it eagerly instead."
+        }
+    } catch {
+        Write-Warning "PSLazy: Failed to read manifest '$resolvedPsd1': $_"
+    }
+
+    return $commands
+}
+
+function Install-CommandNotFoundHandler {
+    $ExecutionContext.InvokeCommand.CommandNotFoundAction = {
+        param($commandName, $commandLookupEventArgs)
+
+        if (-not $script:LazyModules.ContainsKey($commandName)) { return }
+
+        $modulePath = $script:LazyModules[$commandName]
+
+        if (-not $script:LoadedModules.ContainsKey($modulePath)) {
+            try {
+                Write-Host "PSLazy: Auto-loading '$modulePath' for '$commandName'..." -ForegroundColor DarkGray
+                Import-Module $modulePath -Global -ErrorAction Stop
+                $script:LoadedModules[$modulePath] = $true
+            } catch {
+                Write-Error "PSLazy: Failed to load '$modulePath': $_"
+                return
+            }
+        }
+
+        # Re-resolve the now-loaded command
+        $resolved = $ExecutionContext.InvokeCommand.GetCommand($commandName, [System.Management.Automation.CommandTypes]::All)
+        if ($resolved) {
+            $commandLookupEventArgs.Command = $resolved
+            $commandLookupEventArgs.StopSearch = $true
+        }
+    }
+}
+
+#endregion
+
+#region Public
+
 function Register-LazyModule {
     <#
     .SYNOPSIS
-        Registers a module to be loaded lazily when one of its commands is first called.
+        Registers a module for lazy-loading when any of its commands are first called.
     .PARAMETER ModulePath
-        The module name (e.g. 'Az') or path to a .psd1 file.
+        Module name or path to a .psd1 file.
     .EXAMPLE
-        Register-LazyModule -ModulePath 'Az'
-        Register-LazyModule -ModulePath 'C:\Modules\MyModule\MyModule.psd1'
+        Register-LazyModule 'Pester'
+        Register-LazyModule 'C:\Modules\MyModule\MyModule.psd1'
+        'Az', 'SqlServer' | Register-LazyModule
     #>
     [CmdletBinding()]
     param(
@@ -21,113 +94,35 @@ function Register-LazyModule {
 
     process {
         foreach ($path in $ModulePath) {
-            $moduleKey = [System.IO.Path]::GetFileNameWithoutExtension($path)
-
-            # Read exported commands from manifest or scan for commands
-            $commands = Get-LazyModuleCommands -ModulePath $path
-
-            if ($commands.Count -eq 0) {
-                Write-Warning "PSLazy: No exported commands found for '$moduleKey'. It will not be lazy-loaded."
+            # Prevent double-registration
+            if ($script:LoadedModules.ContainsKey($path)) {
+                Write-Warning "PSLazy: '$path' is already loaded — skipping."
                 continue
+            }
+
+            $commands = Get-LazyModuleCommands -ModulePath $path
+            if ($commands.Count -eq 0) { continue }
+
+            $dupes = $commands | Where-Object { $script:LazyModules.ContainsKey($_) -and $script:LazyModules[$_] -ne $path }
+            foreach ($dupe in $dupes) {
+                Write-Warning "PSLazy: Command '$dupe' already registered to '$($script:LazyModules[$dupe])' — overwriting with '$path'."
             }
 
             foreach ($cmd in $commands) {
                 $script:LazyModules[$cmd] = $path
             }
 
-            Write-Verbose "PSLazy: Registered '$moduleKey' with $($commands.Count) commands."
+            Write-Verbose "PSLazy: Registered '$path' ($($commands.Count) commands)."
         }
     }
-}
-
-function Get-LazyModuleCommands {
-    [CmdletBinding()]
-    param([string]$ModulePath)
-
-    # Try reading the .psd1 manifest directly (fast, no import needed)
-    $resolvedPsd1 = $null
-
-    if ($ModulePath -match '\.psd1$' -and (Test-Path $ModulePath)) {
-        $resolvedPsd1 = $ModulePath
-    } else {
-        # Find module by name in PSModulePath
-        $mod = Get-Module -Name $ModulePath -ListAvailable -ErrorAction SilentlyContinue |
-            Select-Object -First 1
-        if ($mod) {
-            $resolvedPsd1 = $mod.Path
-        }
-    }
-
-    $commands = [System.Collections.Generic.List[string]]::new()
-
-    if ($resolvedPsd1) {
-        try {
-            $manifest = Import-PowerShellDataFile -Path $resolvedPsd1 -ErrorAction Stop
-
-            # Collect all exported command types
-            $keys = @(
-                'FunctionsToExport',
-                'CmdletsToExport',
-                'AliasesToExport'
-            )
-
-            foreach ($key in $keys) {
-                if ($manifest[$key]) {
-                    # Wildcard '*' means we can't know ahead of time — skip pre-registration
-                    $exports = $manifest[$key] | Where-Object { $_ -and $_ -ne '*' }
-                    $commands.AddRange([string[]]$exports)
-                }
-            }
-        } catch {
-            Write-Warning "PSLazy: Failed to read manifest for '$ModulePath': $_"
-        }
-    }
-
-    return $commands
-}
-
-function Initialize-PSLazy {
-    <#
-    .SYNOPSIS
-        Installs the CommandNotFound handler that auto-loads lazy modules.
-        Called automatically when PSLazy is imported.
-    #>
-    $ExecutionContext.InvokeCommand.CommandNotFoundAction = {
-        param($commandName, $commandLookupEventArgs)
-
-        if ($script:LazyModules.ContainsKey($commandName)) {
-            $modulePath = $script:LazyModules[$commandName]
-
-            if (-not $script:LoadedModules.ContainsKey($modulePath)) {
-                Write-Host "PSLazy: Auto-loading module for '$commandName'..." -ForegroundColor DarkGray
-                Import-Module $modulePath -Global -ErrorAction Stop
-                $script:LoadedModules[$modulePath] = $true
-            }
-
-            # Tell PowerShell to re-look up the command
-            $commandLookupEventArgs.CommandScriptBlock = {
-                & $commandName @args
-            }.GetNewClosure()
-
-            $commandLookupEventArgs.StopSearch = $true
-        }
-    }
-}
-
-function Get-LazyModule {
-    <#
-    .SYNOPSIS
-        Lists all registered lazy modules and their commands.
-    #>
-    $script:LazyModules.GetEnumerator() |
-        Select-Object @{N='Command';E={$_.Key}}, @{N='Module';E={$_.Value}} |
-        Sort-Object Module, Command
 }
 
 function Unregister-LazyModule {
     <#
     .SYNOPSIS
         Removes a module from the lazy-load registry.
+    .PARAMETER ModulePath
+        Module name or path matching what was passed to Register-LazyModule.
     #>
     [CmdletBinding()]
     param(
@@ -135,16 +130,37 @@ function Unregister-LazyModule {
         [string]$ModulePath
     )
 
-    $keysToRemove = $script:LazyModules.GetEnumerator() |
-        Where-Object { $_.Value -eq $ModulePath } |
-        Select-Object -ExpandProperty Key
+    $keys = @($script:LazyModules.GetEnumerator() |
+        Where-Object Value -EQ $ModulePath |
+        Select-Object -ExpandProperty Key)
 
-    foreach ($key in $keysToRemove) {
-        $script:LazyModules.Remove($key)
+    if ($keys.Count -eq 0) {
+        Write-Warning "PSLazy: No registration found for '$ModulePath'."
+        return
     }
 
-    Write-Verbose "PSLazy: Unregistered '$ModulePath'."
+    foreach ($key in $keys) { $script:LazyModules.Remove($key) }
+    Write-Verbose "PSLazy: Unregistered '$ModulePath' ($($keys.Count) commands removed)."
 }
 
-# Auto-install the handler when module is imported
-Initialize-PSLazy
+function Get-LazyModule {
+    <#
+    .SYNOPSIS
+        Lists all registered lazy modules and their pending/loaded state.
+    #>
+    [CmdletBinding()]
+    param()
+
+    $script:LazyModules.GetEnumerator() |
+        Group-Object Value |
+        Select-Object `
+            @{ N = 'Module';   E = { $_.Name } },
+            @{ N = 'Commands'; E = { $_.Count } },
+            @{ N = 'Loaded';   E = { $script:LoadedModules.ContainsKey($_.Name) } } |
+        Sort-Object Module
+}
+
+#endregion
+
+# Install the handler once when PSLazy itself is imported
+Install-CommandNotFoundHandler
